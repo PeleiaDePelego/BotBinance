@@ -1,117 +1,98 @@
-import csv
-import time
-from datetime import datetime
 from collections import defaultdict
 from operator import itemgetter
+from datetime import datetime
+from time import time
 from binance.client import Client
-import config
+import os
+import csv
+import requests
 
 FEE = 0.00075
 ITERATIONS = 5000
 PRIMARY = ['ETH', 'USDT', 'BTC', 'BNB', 'ADA', 'SOL', 'LINK', 'LTC', 'UNI', 'XTZ']
 
+API_KEY = os.getenv('API_KEY')
+API_SECRET = os.getenv('API_SECRET')
+client = Client(API_KEY, API_SECRET)
 
-# ---------- Agents ----------
-class PriceAgent:
-    def __init__(self, client):
-        self.client = client
+def get_public_ip():
+    try:
+        ip = requests.get('https://api64.ipify.org').text
+        print(f'IP público do servidor: {ip}')
+    except Exception as e:
+        print(f'Erro ao obter IP público: {e}')
 
-    def get_prices(self):
-        prices = self.client.get_orderbook_tickers()
-        prepared = defaultdict(dict)
-        for ticker in prices:
-            pair = ticker['symbol']
-            ask = float(ticker['askPrice'])
-            bid = float(ticker['bidPrice'])
-            if ask == 0.0:
-                continue
-            for primary in PRIMARY:
-                if pair.endswith(primary):
-                    secondary = pair[:-len(primary)]
-                    prepared[primary][secondary] = 1 / ask
-                    prepared[secondary][primary] = bid
-        return prepared
-
-
-class TriangleAgent:
-    def __init__(self):
-        self.seen = set()
-
-    def find_triangles(self, prices, base='USDT'):
-        for triangle in self._recurse(prices, base, base):
-            coins = tuple(triangle['coins'])
-            if coins not in self.seen:
-                self.seen.add(coins)
-                yield triangle
-
-    def _recurse(self, prices, current, start, depth=3, amount=1.0):
-        if depth > 0:
-            for coin, price in prices.get(current, {}).items():
-                new_amount = (amount * price) * (1.0 - FEE)
-                for triangle in self._recurse(prices, coin, start, depth - 1, new_amount):
-                    triangle['coins'].append(current)
-                    yield triangle
-        elif current == start and amount > 1.0:
-            yield {'coins': [current], 'profit': amount}
-
-
-class DecisionAgent:
-    def __init__(self, min_profit=0.1):
-        self.min_profit = min_profit
-
-    def should_trade(self, triangle):
-        profit_pct = (triangle['profit'] - 1.0) * 100
-        return profit_pct >= self.min_profit
-
-
-class ExecutionAgent:
-    def __init__(self, simulate=True):
-        self.simulate = simulate
-
-    def execute(self, triangle):
-        if self.simulate:
-            print(f"Simulando execução: {triangle}")
-        else:
-            # Aqui entraria lógica real de execução de ordens
-            pass
-
-
-# ---------- Utilidades ----------
-def describe_triangle(prices, triangle, writer):
-    coins = triangle['coins'][::-1]
-    price_pct = round((triangle['profit'] - 1.0) * 100, 4)
-    timestamp = datetime.now()
-    print(f"{timestamp} {'->'.join(coins):30} {price_pct}%")
-    writer.writerow([timestamp, '->'.join(coins), price_pct])
-    for i in range(len(coins) - 1):
-        print(f"     {coins[i+1]:4} / {coins[i]:4}: {prices[coins[i]][coins[i+1]]:.8f}")
-    print("")
-
-
-# ---------- Main ----------
 def main():
-    client = Client(config.API_KEY, config.API_SECRET)
+    get_public_ip()  # <- Aqui mostramos o IP do Render nos logs
+    start_time = time()
+    csvfile = open('arbitrage.csv', 'w', newline='', encoding='UTF8')
+    result_writer = csv.writer(csvfile, delimiter=',')
 
-    price_agent = PriceAgent(client)
-    triangle_agent = TriangleAgent()
-    decision_agent = DecisionAgent(min_profit=0.15)
-    execution_agent = ExecutionAgent(simulate=True)
-
-    with open('arbitrage.csv', 'w', newline='', encoding='UTF8') as f:
-        writer = csv.writer(f)
-        writer.writerow(['Timestamp', 'Path', 'Profit (%)'])
-
-        for _ in range(ITERATIONS):
-            prices = price_agent.get_prices()
-            triangles = list(triangle_agent.find_triangles(prices))
-
+    n = 0
+    while n < ITERATIONS:
+        n += 1
+        prices = get_prices()
+        triangles = list(find_triangles(prices))
+        if triangles:
             for triangle in sorted(triangles, key=itemgetter('profit'), reverse=True):
-                if decision_agent.should_trade(triangle):
-                    describe_triangle(prices, triangle, writer)
-                    execution_agent.execute(triangle)
+                describe_triangle(prices, triangle, result_writer)
+            print('________')
 
-            time.sleep(1)  # evitar sobrecarga da API
+def get_prices():
+    prices = client.get_orderbook_tickers()
+    prepared = defaultdict(dict)
+    for ticker in prices:
+        pair = ticker['symbol']
+        ask = float(ticker['askPrice'])
+        bid = float(ticker['bidPrice'])
+        if ask == 0.0:
+            continue
+        for primary in PRIMARY:
+            if pair.endswith(primary):
+                secondary = pair[:-len(primary)]
+                prepared[primary][secondary] = 1 / ask
+                prepared[secondary][primary] = bid
+    return prepared
 
+def find_triangles(prices):
+    triangles = []
+    starting_coin = 'USDT'
+    for triangle in recurse_triangle(prices, starting_coin, starting_coin):
+        coins = set(triangle['coins'])
+        if not any(prev_triangle == coins for prev_triangle in triangles):
+            yield triangle
+            triangles.append(coins)
+    starting_coin = 'BUSD'
+    for triangle in recurse_triangle(prices, starting_coin, starting_coin):
+        coins = set(triangle['coins'])
+        if not any(prev_triangle == coins for prev_triangle in triangles):
+            yield triangle
+            triangles.append(coins)
+
+def recurse_triangle(prices, current_coin, starting_coin, depth_left=3, amount=1.0):
+    if depth_left > 0:
+        pairs = prices[current_coin]
+        for coin, price in pairs.items():
+            new_price = (amount * price) * (1.0 - FEE)
+            for triangle in recurse_triangle(prices, coin, starting_coin, depth_left - 1, new_price):
+                triangle['coins'] = triangle['coins'] + [current_coin]
+                yield triangle
+    elif current_coin == starting_coin and amount > 1.0:
+        yield {
+            'coins': [current_coin],
+            'profit': amount
+        }
+
+def describe_triangle(prices, triangle, result_writer):
+    coins = triangle['coins']
+    price_percentage = (triangle['profit'] - 1.0) * 100
+    print(f"{datetime.now()} {'->'.join(coins):26} {round(price_percentage, 4):-7}% profit")
+    result_writer.writerow([datetime.now(), '->'.join(coins), round(price_percentage, 4)])
+    for i in range(len(coins) - 1):
+        first = coins[i]
+        second = coins[i + 1]
+        print(f"     {second:4} / {first:4}: {prices[first][second]:-17.8f}")
+    print('')
 
 if __name__ == '__main__':
     main()
